@@ -1,0 +1,1201 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: free5gmano-fixed-code
+data:
+  views.py: |
+    # Copyright 2020 free5gmano
+    # All Rights Reserved.
+    #
+    #
+    #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    #    not use this file except in compliance with the License. You may obtain
+    #    a copy of the License at
+    #
+    #         http://www.apache.org/licenses/LICENSE-2.0
+    #
+    #    Unless required by applicable law or agreed to in writing, software
+    #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    #    License for the specific language governing permissions and limitations
+    #    under the License.
+
+    import os
+    import yaml
+    import json
+    import shutil
+    import zipfile
+    import importlib
+
+    from django.http import JsonResponse, Http404, HttpResponse
+    from rest_framework.response import Response
+    from rest_framework import status, mixins
+    from rest_framework.decorators import action
+    from rest_framework.viewsets import ModelViewSet, GenericViewSet
+    from rest_framework.authtoken.views import ObtainAuthToken
+    from rest_framework.authtoken.models import Token
+
+    from nssmf.serializers import SliceTemplateSerializer, SliceTemplateRelationSerializer, \
+        GenericTemplateSerializer, GenericTemplateFileSerializer, ServiceMappingPluginSerializer, \
+        ServiceMappingPluginRelationSerializer
+    from nssmf.models import SliceTemplate, GenericTemplate, ServiceMappingPluginModel, Content
+    from nssmf.enums import OperationStatus, PluginOperationStatus
+    from free5gmano import settings
+
+
+    class CustomAuthToken(ObtainAuthToken):
+
+        def post(self, request, *args, **kwargs):
+            serializer = self.serializer_class(data=request.data,
+                                               context={'request': request})
+            serializer.is_valid(raise_exception=True)
+            user = serializer.validated_data['user']
+            token, created = Token.objects.get_or_create(user=user)
+            return JsonResponse({
+                'token': token.key,
+                'user_id': user.pk,
+                'email': user.email
+            })
+
+
+    class MultipleSerializerViewSet(ModelViewSet):
+        def get_serializer_class(self):
+            if self.basename == 'GenericTemplate':
+                if self.action == 'upload':
+                    return GenericTemplateFileSerializer
+                return GenericTemplateSerializer
+            elif self.basename == 'SliceTemplate':
+                if self.action in ('retrieve', 'list'):
+                    return SliceTemplateRelationSerializer
+                return SliceTemplateSerializer
+            elif self.basename == 'Provisioning':
+                return SliceTemplateSerializer
+
+
+    class GenericTemplateView(MultipleSerializerViewSet):
+        """ Generic Template
+        """
+        queryset = GenericTemplate.objects.all()
+        serializer_class = MultipleSerializerViewSet.get_serializer_class
+
+        @staticmethod
+        def check(request, content, filename):
+            # Check content isn't exist Content
+            for query in Content.objects.all():
+                if str(content['topology_template']) in query.topology_template and \
+                        request.data['nfvoType'] in query.templateId.nfvoType:
+                    response = {
+                        OperationStatus.OPERATION_FAILED: request.data[
+                                                              'templateType'] + ' is exist ' + filename}
+                    return response
+
+        def list(self, request, *args, **kwargs):
+            """
+                Query Generic Template information.
+                The GET method queries the information of the Generic Template matching the filter.
+            """
+            return super().list(request, *args, **kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Generic Template resource.
+                The POST method creates a new individual Generic Template resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Read information about an individual Generic Template resource.
+                The GET method reads the information of a Generic Template.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Generic Template resource.
+                The PATCH method updates the information of a Generic Template.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Generic Template.
+                The DELETE method deletes an individual Generic Template resource.
+            """
+            file = self.get_object().templateFile
+            if file:
+                file_folder = os.path.join(
+                    settings.MEDIA_ROOT,
+                    os.path.dirname(str(self.get_object().templateFile)),
+                    str(self.get_object().templateId)
+                )
+                shutil.rmtree(file_folder)
+                file.delete()
+            return super().destroy(request, *args, **kwargs)
+
+        def upload(self, request, *args, **kwargs):
+            """
+                Upload a Generic Template by providing the content of the Generic Template.
+                The PUT method uploads the content of a Generic Template.
+            """
+            path = os.path.join(
+                settings.MEDIA_ROOT,
+                request.data['templateType'],
+                str(kwargs['pk'])
+            )
+            generic_template_obj = self.get_object()
+            # Delete old Content related
+            for relate_obj in self.get_object().content_set.all():
+                file = self.get_object().templateFile
+                file.delete()
+                self.get_object().content_set.remove(relate_obj)
+                
+            with zipfile.ZipFile(request.data['templateFile']) as _zipfile:
+                for element in _zipfile.namelist():
+                    if '.yaml' in element:
+                        with _zipfile.open(element) as file:
+                            content = yaml.load(file, Loader=yaml.FullLoader)
+                            content_obj = Content(type=self.get_object().templateType,
+                                                  tosca_definitions_version=content['tosca_definitions_version'],
+                                                  topology_template=str(content['topology_template']))
+                        # check_result = self.check(request, content, filename)
+
+                        # if check_result:
+                        #     return Response(check_result, status=400)
+
+                        content_obj.save()
+                        generic_template_obj.content_set.add(content_obj)
+                    elif '.json' in element:
+                        with _zipfile.open(element) as file:
+                            content = json.loads(file.read().decode('utf-8'))
+                        content_obj = Content(type=self.get_object().templateType,
+                                              tosca_definitions_version="None",
+                                              topology_template=str(content))
+                        content_obj.save()
+                        generic_template_obj.content_set.add(content_obj)
+                _zipfile.extractall(path=path)
+            # Lấy tên file gốc từ request
+            relative_path = request.data['templateFile'].name 
+        # Tạo URL tuyệt đối dựa trên NM_IP đã cấu hình trong settings.py
+            full_url = "http://{}/download/{}".format(settings.NM_IP, relative_path)
+        
+        # Cập nhật trực tiếp vào object thay vì dùng partial_update từ request
+            generic_template_obj.templateFile = full_url
+            generic_template_obj.save()
+        # ----------------------------------
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        @action(detail=False, methods=['get'], url_path='example_download/(?P<example>(.)*)/(?P<path>(.)*)')
+        def example_download(self, request, *args, **kwargs):
+            """
+                Download an individual Generic Template.
+                The GET method reads the content of the Generic Template.
+            """
+            source_path = os.getcwd()
+            example_file = os.path.join(settings.BASE_DIR, 'nssmf', 'template_example',
+                                        kwargs['example'], kwargs['path'].split('/')[0])
+            os.chdir(example_file)
+
+            with zipfile.ZipFile(example_file + '.zip', mode='w',
+                                 compression=zipfile.ZIP_DEFLATED) as zf:
+                for root, folders, files in os.walk('.'):
+                    for s_file in files:
+                        a_file = os.path.join(root, s_file)
+                        zf.write(a_file)
+            os.chdir(source_path)
+            with open(example_file + '.zip', 'rb') as f:
+                return HttpResponse(f.read(), content_type="application/zip")
+
+        @action(detail=False, methods=['get'], url_path='download/(?P<path>(.)*)')
+        def download(self, request, *args, **kwargs):
+            """
+                Download an individual Generic Template for Free5Gmano Dashboard.
+                The GET method reads the content of the Generic Template.
+            """
+            download_query = self.queryset.filter(templateFile=kwargs['path'])
+            s = download_query[0].templateFile.name
+            filename = s[4:]
+            if download_query:
+                with download_query[0].templateFile.open() as f:
+                    # return HttpResponse(f.read(), content_type="application/zip")
+                    response = HttpResponse(f.read(), content_type="application/zip")
+                    response['Content-Disposition'] = 'inline; filename=' + filename
+                    return response
+
+
+    class SliceTemplateView(MultipleSerializerViewSet):
+        """
+            Slice Template
+        """
+        queryset = SliceTemplate.objects.all()
+        serializer_class = MultipleSerializerViewSet.get_serializer_class
+
+        def list(self, request, *args, **kwargs):
+            """
+                Query Slice Template information.
+                The GET method queries the information of the Slice Template matching the filter.
+            """
+            return super().list(request, *args, **kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Slice Template resource.
+                The POST method creates a new individual Slice Template resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Read information about an individual Slice Template resource.
+                The GET method reads the information of a Slice Template.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Slice Template resource.
+                The PATCH method updates the information of a Slice Template.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Slice Template.
+                The DELETE method deletes an individual Slice Template resource.
+            """
+            return super().destroy(request, *args, **kwargs)
+
+
+    class ProvisioningView(GenericViewSet, mixins.CreateModelMixin, mixins.DestroyModelMixin):
+        """ Provisioning Network Slice Instance
+        """
+        queryset = SliceTemplate.objects.all()
+        serializer_class = ServiceMappingPluginRelationSerializer
+
+        def create(self, request, *args, **kwargs):
+            """
+                Allocate Network Slice Subnet Instance.
+                Allocate a new individual Network Slice Subnet Instance
+            """
+            data = request.data['attributeListIn']
+            response_data = dict()
+            try:
+                response_data['status'] = OperationStatus.OPERATION_FAILED
+                if data['using_existed']:
+                    check_query = SliceTemplate.objects.filter(instanceId=data['using_existed'])
+                    for query in check_query:
+                        query.instanceId.remove(data['using_existed'])
+                unit_query = SliceTemplate.objects.get(templateId=data['nsstid'])
+                slice_serializer = ServiceMappingPluginRelationSerializer(unit_query)
+                generic_templates = slice_serializer.data['genericTemplates']
+                # FIX: Handle empty nfvoType list
+                nfvo_type_list = slice_serializer.data.get('nfvoType', [])
+                if not nfvo_type_list:
+                    print("Warning: nfvoType is empty, using default 'kube5gnfvo'")
+                    response_data['error'] = "nfvoType is not configured in slice template"
+                    return JsonResponse(response_data, status=400)
+                service_plugin = nfvo_type_list[0]
+            except SliceTemplate.DoesNotExist:
+                print(SliceTemplate.DoesNotExist)
+                return JsonResponse(response_data)
+            try:
+                parameter = {
+                    'vnf_template': generic_templates['VNF'][0],
+                    'ns_template': generic_templates['NSD'][0],
+                    'slice_template': generic_templates['NRM'][0],
+                    'use_existed': data['using_existed']
+                }
+                plugin = importlib.import_module(
+                    'nssmf.plugin.{}.{}.{}'.format(
+                        service_plugin['name'],
+                        service_plugin['allocate_nssi'].split('/')[0],
+                        service_plugin['allocate_nssi'].split('/')[1].split('.')[0]))
+                nfvo_plugin = plugin.NFVOPlugin(
+                            service_plugin['nm_host'],
+                            service_plugin['nfvo_host'],
+                            service_plugin['subscription_host'],
+                            parameter)
+                nfvo_plugin.allocate_nssi()
+                unit_query.instanceId.add(nfvo_plugin.nssiId)
+                return JsonResponse(nfvo_plugin.moi_config)
+            except IOError as e:
+                return JsonResponse(response_data, status=400)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Deallocate Network Slice Subnet Instance.
+                Deallocate a new individual Network Slice Subnet Instance
+            """
+            response_data = dict()
+            response_data['status'] = OperationStatus.OPERATION_FAILED
+            try:
+                slice_id = kwargs['pk']
+                if self.get_queryset().filter(instanceId=slice_id):
+                    response_data['status'] = OperationStatus.OPERATION_SUCCEEDED
+                    unit_query = self.get_queryset().filter(instanceId=slice_id)[0]
+                    slice_serializer = self.get_serializer(unit_query)
+                    service_plugin = slice_serializer.data['nfvoType'][0]
+                    parameter = {
+                        'slice_template': slice_serializer.data['templateId'],
+                        'slice_instance': slice_id,
+                        'mano_template': False
+                    }
+                    plugin = importlib.import_module(
+                        'nssmf.plugin.{}.{}.{}'.format(
+                            service_plugin['name'],
+                            service_plugin['deallocate_nssi'].split('/')[0],
+                            service_plugin['deallocate_nssi'].split('/')[1].split('.')[0]))
+                    nfvo_plugin = plugin.NFVOPlugin(service_plugin['nm_host'],
+                                                    service_plugin['nfvo_host'],
+                                                    service_plugin['subscription_host'],
+                                                    parameter)
+                    nfvo_plugin.deallocate_nssi()
+                    unit_query.instanceId.remove(slice_id)
+                    return JsonResponse(response_data)
+                else:
+                    return JsonResponse(response_data, status=400)
+            except TypeError:
+                return JsonResponse(response_data, status=400)
+
+    class ServiceMappingPluginView(ModelViewSet):
+        """ Service Mapping Plugin framework
+        """
+        queryset = ServiceMappingPluginModel.objects.all()
+        serializer_class = ServiceMappingPluginSerializer
+        response_data = dict()
+
+        def list(self, request, *args, **kwargs):
+            """
+                Read information about an individual Service Mapping Plugin resource.
+                The GET method reads the information of a Service Mapping Plugin.
+            """
+            return super().list(self, request, args, kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Service Mapping Plugin resource.
+                The POST method creates a new individual Service Mapping Plugin resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Query Service Mapping Plugin information.
+                The GET method queries the information of the Service Mapping Plugin \
+                matching the filter.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Service Mapping Plugin resource.
+                The PATCH method updates the information of a Service Mapping Plugin.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Service Mapping Plugin.
+                The DELETE method deletes an individual Service Mapping Plugin resource.
+            """
+            self_object = self.get_object()
+            file = self_object.pluginFile
+            if file:
+                file_folder = os.path.join(
+                    settings.PLUGIN_ROOT,
+                    self_object.name
+                )
+                shutil.rmtree(file_folder)
+                file.delete()
+            super().destroy(self, request, args, kwargs)
+            self.response_data['status'] = PluginOperationStatus.DELETE
+            return JsonResponse(self.response_data, status=200)
+
+        @action(detail=False, methods=['get'], url_path='download/(?P<name>(.)*)/(?P<filename>(.)*)')
+        def download(self, request, *args, **kwargs):
+            """
+                Download an individual Service Mapping Plugin.
+                The GET method reads the content of the Service Mapping Plugin.
+            """
+            try:
+                plugin_obj = ServiceMappingPluginModel.objects.get(name=kwargs['name'])
+                with plugin_obj.pluginFile.open() as f:
+                    response = HttpResponse(f.read(), content_type="application/zip")
+                    response['Content-Disposition'] = 'inline; filename=' + kwargs['filename']
+                    return response
+            except IOError:
+                raise Http404
+  settings.py: |
+    import os
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PLUGIN_ROOT = os.path.join(BASE_DIR, 'nssmf', 'plugin')
+    MEDIA_ROOT = "/data/nm"
+    MEDIA_URL = 'download/'
+    # Biến quan trọng để gen URL tự động
+    NM_IP = "192.168.180.54:30088" 
+    
+    DATABASE_USER = os.getenv('FREE5GMANO_MYSQL_USER', 'root')
+    DATABASE_PASSWORD = os.getenv('FREE5GMANO_MYSQL_PASSWORD', 'password')
+    DATABASE_HOST = os.getenv('FREE5GMANO_MYSQL_HOST', 'free5gmano-mysql')
+    DATABASE_PORT = os.getenv('FREE5GMANO_MYSQL_PORT', '3306')
+    DATABASE_NAME = os.getenv('FREE5GMANO_DB_NAME', 'free5gmano')
+
+    SECRET_KEY = 'o!#rpcte*37y_shpqb&uobz3^myc^_u*cr(c=twq=8rf!z1moq'
+    DEBUG = True
+    ALLOWED_HOSTS = ['*']
+    INSTALLED_APPS = [---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: free5gmano-fixed-code
+data:
+  views.py: |
+    # Copyright 2020 free5gmano
+    # All Rights Reserved.
+    #
+    #
+    #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    #    not use this file except in compliance with the License. You may obtain
+    #    a copy of the License at
+    #
+    #         http://www.apache.org/licenses/LICENSE-2.0
+    #
+    #    Unless required by applicable law or agreed to in writing, software
+    #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    #    License for the specific language governing permissions and limitations
+    #    under the License.
+
+    import os
+    import yaml
+    import json
+    import shutil
+    import zipfile
+    import importlib
+
+    from django.http import JsonResponse, Http404, HttpResponse
+    from rest_framework.response import Response
+    from rest_framework import status, mixins
+    from rest_framework.decorators import action
+    from rest_framework.viewsets import ModelViewSet, GenericViewSet
+    from rest_framework.authtoken.views import ObtainAuthToken
+    from rest_framework.authtoken.models import Token
+
+    from nssmf.serializers import SliceTemplateSerializer, SliceTemplateRelationSerializer, \
+        GenericTemplateSerializer, GenericTemplateFileSerializer, ServiceMappingPluginSerializer, \
+        ServiceMappingPluginRelationSerializer
+    from nssmf.models import SliceTemplate, GenericTemplate, ServiceMappingPluginModel, Content
+    from nssmf.enums import OperationStatus, PluginOperationStatus
+    from free5gmano import settings
+
+
+    class CustomAuthToken(ObtainAuthToken):
+
+        def post(self, request, *args, **kwargs):
+            serializer = self.serializer_class(data=request.data,
+                                               context={'request': request})
+            serializer.is_valid(raise_exception=True)
+            user = serializer.validated_data['user']
+            token, created = Token.objects.get_or_create(user=user)
+            return JsonResponse({
+                'token': token.key,
+                'user_id': user.pk,
+                'email': user.email
+            })
+
+
+    class MultipleSerializerViewSet(ModelViewSet):
+        def get_serializer_class(self):
+            if self.basename == 'GenericTemplate':
+                if self.action == 'upload':
+                    return GenericTemplateFileSerializer
+                return GenericTemplateSerializer
+            elif self.basename == 'SliceTemplate':
+                if self.action in ('retrieve', 'list'):
+                    return SliceTemplateRelationSerializer
+                return SliceTemplateSerializer
+            elif self.basename == 'Provisioning':
+                return SliceTemplateSerializer
+
+
+    class GenericTemplateView(MultipleSerializerViewSet):
+        """ Generic Template
+        """
+        queryset = GenericTemplate.objects.all()
+        serializer_class = MultipleSerializerViewSet.get_serializer_class
+
+        @staticmethod
+        def check(request, content, filename):
+            # Check content isn't exist Content
+            for query in Content.objects.all():
+                if str(content['topology_template']) in query.topology_template and \
+                        request.data['nfvoType'] in query.templateId.nfvoType:
+                    response = {
+                        OperationStatus.OPERATION_FAILED: request.data[
+                                                              'templateType'] + ' is exist ' + filename}
+                    return response
+
+        def list(self, request, *args, **kwargs):
+            """
+                Query Generic Template information.
+                The GET method queries the information of the Generic Template matching the filter.
+            """
+            return super().list(request, *args, **kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Generic Template resource.
+                The POST method creates a new individual Generic Template resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Read information about an individual Generic Template resource.
+                The GET method reads the information of a Generic Template.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Generic Template resource.
+                The PATCH method updates the information of a Generic Template.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Generic Template.
+                The DELETE method deletes an individual Generic Template resource.
+            """
+            file = self.get_object().templateFile
+            if file:
+                file_folder = os.path.join(
+                    settings.MEDIA_ROOT,
+                    os.path.dirname(str(self.get_object().templateFile)),
+                    str(self.get_object().templateId)
+                )
+                shutil.rmtree(file_folder)
+                file.delete()
+            return super().destroy(request, *args, **kwargs)
+
+        def upload(self, request, *args, **kwargs):
+            """
+                Upload a Generic Template by providing the content of the Generic Template.
+                The PUT method uploads the content of a Generic Template.
+            """
+            path = os.path.join(
+                settings.MEDIA_ROOT,
+                request.data['templateType'],
+                str(kwargs['pk'])
+            )
+            generic_template_obj = self.get_object()
+            # Delete old Content related
+            for relate_obj in self.get_object().content_set.all():
+                file = self.get_object().templateFile
+                file.delete()
+                self.get_object().content_set.remove(relate_obj)
+                
+            with zipfile.ZipFile(request.data['templateFile']) as _zipfile:
+                for element in _zipfile.namelist():
+                    if '.yaml' in element:
+                        with _zipfile.open(element) as file:
+                            content = yaml.load(file, Loader=yaml.FullLoader)
+                            content_obj = Content(type=self.get_object().templateType,
+                                                  tosca_definitions_version=content['tosca_definitions_version'],
+                                                  topology_template=str(content['topology_template']))
+                        # check_result = self.check(request, content, filename)
+
+                        # if check_result:
+                        #     return Response(check_result, status=400)
+
+                        content_obj.save()
+                        generic_template_obj.content_set.add(content_obj)
+                    elif '.json' in element:
+                        with _zipfile.open(element) as file:
+                            content = json.loads(file.read().decode('utf-8'))
+                        content_obj = Content(type=self.get_object().templateType,
+                                              tosca_definitions_version="None",
+                                              topology_template=str(content))
+                        content_obj.save()
+                        generic_template_obj.content_set.add(content_obj)
+                _zipfile.extractall(path=path)
+            # Lấy tên file gốc từ request
+            relative_path = request.data['templateFile'].name 
+        # Tạo URL tuyệt đối dựa trên NM_IP đã cấu hình trong settings.py
+            full_url = "http://{}/download/{}".format(settings.NM_IP, relative_path)
+        
+        # Cập nhật trực tiếp vào object thay vì dùng partial_update từ request
+            generic_template_obj.templateFile = full_url
+            generic_template_obj.save()
+        # ----------------------------------
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        @action(detail=False, methods=['get'], url_path='example_download/(?P<example>(.)*)/(?P<path>(.)*)')
+        def example_download(self, request, *args, **kwargs):
+            """
+                Download an individual Generic Template.
+                The GET method reads the content of the Generic Template.
+            """
+            source_path = os.getcwd()
+            example_file = os.path.join(settings.BASE_DIR, 'nssmf', 'template_example',
+                                        kwargs['example'], kwargs['path'].split('/')[0])
+            os.chdir(example_file)
+
+            with zipfile.ZipFile(example_file + '.zip', mode='w',
+                                 compression=zipfile.ZIP_DEFLATED) as zf:
+                for root, folders, files in os.walk('.'):
+                    for s_file in files:
+                        a_file = os.path.join(root, s_file)
+                        zf.write(a_file)
+            os.chdir(source_path)
+            with open(example_file + '.zip', 'rb') as f:
+                return HttpResponse(f.read(), content_type="application/zip")
+
+        @action(detail=False, methods=['get'], url_path='download/(?P<path>(.)*)')
+        def download(self, request, *args, **kwargs):
+            """
+                Download an individual Generic Template for Free5Gmano Dashboard.
+                The GET method reads the content of the Generic Template.
+            """
+            download_query = self.queryset.filter(templateFile=kwargs['path'])
+            s = download_query[0].templateFile.name
+            filename = s[4:]
+            if download_query:
+                with download_query[0].templateFile.open() as f:
+                    # return HttpResponse(f.read(), content_type="application/zip")
+                    response = HttpResponse(f.read(), content_type="application/zip")
+                    response['Content-Disposition'] = 'inline; filename=' + filename
+                    return response
+
+
+    class SliceTemplateView(MultipleSerializerViewSet):
+        """
+            Slice Template
+        """
+        queryset = SliceTemplate.objects.all()
+        serializer_class = MultipleSerializerViewSet.get_serializer_class
+
+        def list(self, request, *args, **kwargs):
+            """
+                Query Slice Template information.
+                The GET method queries the information of the Slice Template matching the filter.
+            """
+            return super().list(request, *args, **kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Slice Template resource.
+                The POST method creates a new individual Slice Template resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Read information about an individual Slice Template resource.
+                The GET method reads the information of a Slice Template.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Slice Template resource.
+                The PATCH method updates the information of a Slice Template.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Slice Template.
+                The DELETE method deletes an individual Slice Template resource.
+            """
+            return super().destroy(request, *args, **kwargs)
+
+
+    class ProvisioningView(GenericViewSet, mixins.CreateModelMixin, mixins.DestroyModelMixin):
+        """ Provisioning Network Slice Instance
+        """
+        queryset = SliceTemplate.objects.all()
+        serializer_class = ServiceMappingPluginRelationSerializer
+
+        def create(self, request, *args, **kwargs):
+            """
+                Allocate Network Slice Subnet Instance.
+                Allocate a new individual Network Slice Subnet Instance
+            """
+            data = request.data['attributeListIn']
+            response_data = dict()
+            try:
+                response_data['status'] = OperationStatus.OPERATION_FAILED
+                if data['using_existed']:
+                    check_query = SliceTemplate.objects.filter(instanceId=data['using_existed'])
+                    for query in check_query:
+                        query.instanceId.remove(data['using_existed'])
+                unit_query = SliceTemplate.objects.get(templateId=data['nsstid'])
+                slice_serializer = ServiceMappingPluginRelationSerializer(unit_query)
+                generic_templates = slice_serializer.data['genericTemplates']
+                # FIX: Handle empty nfvoType list
+                nfvo_type_list = slice_serializer.data.get('nfvoType', [])
+                if not nfvo_type_list:
+                    print("Warning: nfvoType is empty, using default 'kube5gnfvo'")
+                    response_data['error'] = "nfvoType is not configured in slice template"
+                    return JsonResponse(response_data, status=400)
+                service_plugin = nfvo_type_list[0]
+            except SliceTemplate.DoesNotExist:
+                print(SliceTemplate.DoesNotExist)
+                return JsonResponse(response_data)
+            try:
+                parameter = {
+                    'vnf_template': generic_templates['VNF'][0],
+                    'ns_template': generic_templates['NSD'][0],
+                    'slice_template': generic_templates['NRM'][0],
+                    'use_existed': data['using_existed']
+                }
+                plugin = importlib.import_module(
+                    'nssmf.plugin.{}.{}.{}'.format(
+                        service_plugin['name'],
+                        service_plugin['allocate_nssi'].split('/')[0],
+                        service_plugin['allocate_nssi'].split('/')[1].split('.')[0]))
+                nfvo_plugin = plugin.NFVOPlugin(
+                            service_plugin['nm_host'],
+                            service_plugin['nfvo_host'],
+                            service_plugin['subscription_host'],
+                            parameter)
+                nfvo_plugin.allocate_nssi()
+                unit_query.instanceId.add(nfvo_plugin.nssiId)
+                return JsonResponse(nfvo_plugin.moi_config)
+            except IOError as e:
+                return JsonResponse(response_data, status=400)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Deallocate Network Slice Subnet Instance.
+                Deallocate a new individual Network Slice Subnet Instance
+            """
+            response_data = dict()
+            response_data['status'] = OperationStatus.OPERATION_FAILED
+            try:
+                slice_id = kwargs['pk']
+                if self.get_queryset().filter(instanceId=slice_id):
+                    response_data['status'] = OperationStatus.OPERATION_SUCCEEDED
+                    unit_query = self.get_queryset().filter(instanceId=slice_id)[0]
+                    slice_serializer = self.get_serializer(unit_query)
+                    service_plugin = slice_serializer.data['nfvoType'][0]
+                    parameter = {
+                        'slice_template': slice_serializer.data['templateId'],
+                        'slice_instance': slice_id,
+                        'mano_template': False
+                    }
+                    plugin = importlib.import_module(
+                        'nssmf.plugin.{}.{}.{}'.format(
+                            service_plugin['name'],
+                            service_plugin['deallocate_nssi'].split('/')[0],
+                            service_plugin['deallocate_nssi'].split('/')[1].split('.')[0]))
+                    nfvo_plugin = plugin.NFVOPlugin(service_plugin['nm_host'],
+                                                    service_plugin['nfvo_host'],
+                                                    service_plugin['subscription_host'],
+                                                    parameter)
+                    nfvo_plugin.deallocate_nssi()
+                    unit_query.instanceId.remove(slice_id)
+                    return JsonResponse(response_data)
+                else:
+                    return JsonResponse(response_data, status=400)
+            except TypeError:
+                return JsonResponse(response_data, status=400)
+
+    class ServiceMappingPluginView(ModelViewSet):
+        """ Service Mapping Plugin framework
+        """
+        queryset = ServiceMappingPluginModel.objects.all()
+        serializer_class = ServiceMappingPluginSerializer
+        response_data = dict()
+
+        def list(self, request, *args, **kwargs):
+            """
+                Read information about an individual Service Mapping Plugin resource.
+                The GET method reads the information of a Service Mapping Plugin.
+            """
+            return super().list(self, request, args, kwargs)
+
+        def create(self, request, *args, **kwargs):
+            """
+                Create a new individual Service Mapping Plugin resource.
+                The POST method creates a new individual Service Mapping Plugin resource.
+            """
+            return super().create(request, *args, **kwargs)
+
+        def retrieve(self, request, *args, **kwargs):
+            """
+                Query Service Mapping Plugin information.
+                The GET method queries the information of the Service Mapping Plugin \
+                matching the filter.
+            """
+            return super().retrieve(request, *args, **kwargs)
+
+        def update(self, request, *args, **kwargs):
+            """
+                Update information about an individual Service Mapping Plugin resource.
+                The PATCH method updates the information of a Service Mapping Plugin.
+            """
+            return super().update(request, *args, **kwargs)
+
+        def destroy(self, request, *args, **kwargs):
+            """
+                Delete an individual Service Mapping Plugin.
+                The DELETE method deletes an individual Service Mapping Plugin resource.
+            """
+            self_object = self.get_object()
+            file = self_object.pluginFile
+            if file:
+                file_folder = os.path.join(
+                    settings.PLUGIN_ROOT,
+                    self_object.name
+                )
+                shutil.rmtree(file_folder)
+                file.delete()
+            super().destroy(self, request, args, kwargs)
+            self.response_data['status'] = PluginOperationStatus.DELETE
+            return JsonResponse(self.response_data, status=200)
+
+        @action(detail=False, methods=['get'], url_path='download/(?P<name>(.)*)/(?P<filename>(.)*)')
+        def download(self, request, *args, **kwargs):
+            """
+                Download an individual Service Mapping Plugin.
+                The GET method reads the content of the Service Mapping Plugin.
+            """
+            try:
+                plugin_obj = ServiceMappingPluginModel.objects.get(name=kwargs['name'])
+                with plugin_obj.pluginFile.open() as f:
+                    response = HttpResponse(f.read(), content_type="application/zip")
+                    response['Content-Disposition'] = 'inline; filename=' + kwargs['filename']
+                    return response
+            except IOError:
+                raise Http404
+  settings.py: |
+    import os
+
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PLUGIN_ROOT = os.path.join(BASE_DIR, 'nssmf', 'plugin')
+    MEDIA_ROOT = "/data/nm"
+    MEDIA_URL = '/download/'
+    DATABASE_USER = os.getenv('FREE5GMANO_MYSQL_USER', 'root')
+    DATABASE_PASSWORD = os.getenv('FREE5GMANO_MYSQL_PASSWORD', 'password')
+    DATABASE_HOST = os.getenv('FREE5GMANO_MYSQL_HOST', '10.152.183.187')
+    DATABASE_PORT = os.getenv('FREE5GMANO_MYSQL_PORT', '3306')
+    DATABASE_NAME = os.getenv('FREE5GMANO_DB_NAME', 'free5gmano')
+    NM_IP = os.getenv('FREE5GMANO_NM', '10.152.183.180:8000')
+
+    # Quick-start development settings - unsuitable for production
+    # See https://docs.djangoproject.com/en/2.2/howto/deployment/checklist/
+
+    # SECURITY WARNING: keep the secret key used in production secret!
+    SECRET_KEY = 'o!#rpcte*37y_shpqb&uobz3^myc^_u*cr(c=twq=8rf!z1moq'
+
+    # SECURITY WARNING: don't run with debug turned on in production!
+    DEBUG = True
+    THREAD_POOL = {}
+
+    ALLOWED_HOSTS = ['*']
+
+    # Application definition
+
+    INSTALLED_APPS = [
+        'django.contrib.admin',
+        'django.contrib.auth',
+        'django.contrib.contenttypes',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+        'rest_framework',
+        'jsonschema',
+        'nssmf',
+        "drf_yasg",
+        "moi",
+        'FaultManagement',
+        'corsheaders',
+    ]
+
+    MIDDLEWARE = [
+        'django.middleware.security.SecurityMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'corsheaders.middleware.CorsMiddleware',
+        'django.middleware.common.CommonMiddleware',
+        'django.middleware.csrf.CsrfViewMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    ]
+
+    ROOT_URLCONF = 'free5gmano.urls'
+
+    TEMPLATES = [
+        {
+            'BACKEND': 'django.template.backends.django.DjangoTemplates',
+            'DIRS': [os.path.join(BASE_DIR, 'templates')]
+            ,
+            'APP_DIRS': True,
+            'OPTIONS': {
+                'context_processors': [
+                    'django.template.context_processors.debug',
+                    'django.template.context_processors.request',
+                    'django.contrib.auth.context_processors.auth',
+                    'django.contrib.messages.context_processors.messages',
+                ],
+            },
+        },
+    ]
+
+    WSGI_APPLICATION = 'free5gmano.wsgi.application'
+
+    # Database
+    # https://docs.djangoproject.com/en/2.2/ref/settings/#databases
+
+    DATABASES = {
+        #     'default': {
+        #     'ENGINE': 'django.db.backends.sqlite3',
+        #     'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        # }
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': DATABASE_NAME,
+            'USER': DATABASE_USER,
+            'PASSWORD': DATABASE_PASSWORD,
+            'HOST': DATABASE_HOST,
+            'PORT': DATABASE_PORT,
+        }
+    }
+
+    # Password validation
+    # https://docs.djangoproject.com/en/2.2/ref/settings/#auth-password-validators
+
+    AUTH_PASSWORD_VALIDATORS = [
+        {
+            'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+        },
+        {
+            'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        },
+        {
+            'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+        },
+        {
+            'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        },
+    ]
+
+    # Internationalization
+    # https://docs.djangoproject.com/en/2.2/topics/i18n/
+
+    LANGUAGE_CODE = 'en-us'
+
+    TIME_ZONE = 'UTC'
+
+    USE_I18N = True
+
+    USE_L10N = True
+
+    USE_TZ = True
+
+    # Static files (CSS, JavaScript, Images)
+    # https://docs.djangoproject.com/en/2.2/howto/static-files/
+
+    STATIC_URL = '/static/'
+    CORS_ORIGIN_ALLOW_ALL = True
+    CORS_ALLOW_HEADERS = ['*']
+
+
+  # --- FILE URLS.PY ---
+  urls.py: |
+    from django.contrib import admin
+    from django.urls import path, include
+    from django.conf.urls import url
+    from rest_framework import permissions
+    from drf_yasg.views import get_schema_view
+    from drf_yasg import openapi
+    from django.views.static import serve
+    from django.conf import settings
+
+    schema_view = get_schema_view(
+        openapi.Info(
+            title="free5gmano NM manager API",
+            default_version='v1',
+            description="ETSI TS 128 541 V15.5.0 - 5G Management and orchestration;\
+            5G Network Resource Model (NRM); Stage 2 and stage 3 IMPORTANT: In case of \
+            Please note that this file might be not aligned to the current version of \
+            discrepancies the published ETSI Group Specification takes precedence. refer \
+            https://www.etsi.org/deliver/etsi_ts/128500_128599/128541/15.05.00_60/ts_128541v150500p.pdf\
+            ",
+            terms_of_service="https://github.com/free5gmano/free5gmano",
+            contact=openapi.Contact(email="free5gmano@gmail.com"),
+            license=openapi.License(name="BSD License"),
+        ),
+        public=False,
+        permission_classes=(permissions.AllowAny,),
+    )
+
+    urlpatterns = [
+        url(r'^swagger(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0),
+            name='schema-json'),
+        url(r'^swagger/$', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
+        url(r'^redoc/$', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
+        path('', include('nssmf.urls')),
+        path('', include('moi.urls')),
+        path('', include('FaultManagement.urls')),
+        url(r'^download/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+    ]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: free5gmano
+spec:
+  selector:
+    matchLabels:
+      app: free5gmano
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: free5gmano
+    spec:
+      securityContext:
+          runAsUser: 0
+          fsGroup: 0
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox:1.28
+          command: ['sh', '-c', "until nslookup free5gmano-mysql; do echo waiting for free5gmano-mysql; sleep 2; done"]
+
+      containers:
+        - name: free5gmano
+          image: free5gmano/free5gmano
+          env:
+            - name: FREE5GMANO_MYSQL_USER
+              value: "root"
+            - name: FREE5GMANO_MYSQL_PASSWORD
+              value: "password"
+            - name: FREE5GMANO_MYSQL_HOST
+              value: "free5gmano-mysql"
+            - name: FREE5GMANO_MYSQL_PORT
+              value: "3306"
+            - name: FREE5GMANO_DB_NAME
+              value: "free5gmano"
+          volumeMounts:
+            - name: free5gmano-template-storage
+              mountPath: /data/nm/
+            - name: free5gmano-plugin-storage
+              mountPath: /free5gmano/nssmf/plugin/
+            # Mount fixed views.py
+            - name: fixed-code
+              mountPath: /free5gmano/nssmf/views.py
+              subPath: views.py
+            - name: fixed-code
+              mountPath: /free5gmano/free5gmano/settings.py
+              subPath: settings.py
+            - name: fixed-code
+              mountPath: /free5gmano/free5gmano/urls.py
+              subPath: urls.py
+      volumes:
+        - name: free5gmano-template-storage
+          persistentVolumeClaim:
+            claimName: free5gmano-template-pv-claim
+        - name: free5gmano-plugin-storage
+          persistentVolumeClaim:
+            claimName: free5gmano-plugin-pv-claim
+        # Add ConfigMap volume
+        - name: fixed-code
+          configMap:
+            name: free5gmano-fixed-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: free5gmano
+spec:
+  type: NodePort
+  ports:
+    - name: api-server
+      port: 8000
+      nodePort: 30088
+    - name: socket
+      port: 8888
+      nodePort: 30008
+  selector:
+    app: free5gmano
+---
+kind: PersistentVolume
+apiVersion: v1
+metadata:
+  name: free5gmano-template-pv-volume
+  labels:
+    type: local
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/nm/"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: free5gmano-template-pv-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+kind: PersistentVolume
+apiVersion: v1
+metadata:
+  name: free5gmano-plugin-pv-volume
+  labels:
+    type: local
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/plugin/"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: free5gmano-template-pv-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+kind: PersistentVolume
+apiVersion: v1
+metadata:
+  name: free5gmano-plugin-pv-volume
+  labels:
+    type: local
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/plugin/"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: free5gmano-plugin-pv-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

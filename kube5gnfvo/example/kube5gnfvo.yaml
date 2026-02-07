@@ -1,0 +1,591 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube5gnfvo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube5gnfvo-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: kube5gnfvo
+  namespace: default
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kube5gnfvo-pv
+  labels:
+    name: kube5gnfvo
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    type: DirectoryOrCreate
+    path: /mnt/kube5gnfvo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kube5gnfvo-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  selector:
+    matchExpressions:
+    - key: name
+      operator: In
+      values: ["kube5gnfvo"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube5gnfvo-fixed-code
+data:
+  base_kubernetes.py: |
+    import functools
+    import os
+    import threading
+    from kubernetes import client, config, watch
+    from kubernetes.client.rest import ApiException
+    
+    class MockHTTPResponse:
+        """12345Mock HTTP response object có tất cả methods mà Kubernetes watch cần"""
+        def __init__(self):
+            self.status = 200
+            self.reason = 'OK'
+            self._closed = False
+            self._content = b'{"type":"ERROR","object":{"reason":"KubeVirtDisabled","message":"KubeVirt monitoring is disabled"}}\n'
+            self.headers = {'Content-Type': 'application/json'}
+        
+        def read_chunked(self, decode_content=False):
+            """Generator trả về chunk data để kết thúc stream ngay"""
+            yield self._content
+            yield b''  # Empty chunk để kết thúc stream
+        
+        def close(self):
+            self._closed = True
+        
+        def release_conn(self):
+            pass  # Do nothing
+        
+        def iter_content(self, chunk_size=1):
+            return iter([self._content])
+        
+        def __enter__(self):
+            return self
+        
+        def __exit__(self, *args):
+            self.close()
+    
+    
+    class KubeVirtSafeStub:
+        def __init__(self):
+            self.mock_response = MockHTTPResponse()
+        
+        def list_virtual_machine_instance_for_all_namespaces(self, **kwargs):
+            if kwargs.get('watch', False):
+                return self.mock_response
+            class Result:
+                items = []
+                metadata = type('obj', (), {'_continue': None})()
+            return Result()
+        
+        def list_virtual_machine_instance_replica_set_for_all_namespaces(self, **kwargs):
+            if kwargs.get('watch', False):
+                return self.mock_response
+            class Result:
+                items = []
+                metadata = type('obj', (), {'_continue': None})()
+            return Result()
+        
+        def __getattr__(self, name):
+            def dummy(**kwargs):
+                if kwargs.get('watch', False):
+                    return self.mock_response
+                class Result:
+                    items = []
+                return Result()
+            return dummy
+    
+    kubevirt_safe_stub = KubeVirtSafeStub()
+    # ====== END STUB ======
+
+    lock = threading.Lock()
+    
+    def synchronized(_lock):
+        def wrapper(func):
+            @functools.wraps(func)
+            def inner_wrapper(*args, **kwargs):
+                with _lock:
+                    return func(*args, **kwargs)
+            return inner_wrapper
+        return wrapper
+    
+    class Singleton(type):
+        _instances = {}
+        @synchronized(lock)
+        def __call__(cls, *args, **kwargs):
+            if cls not in cls._instances:
+                cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+            return cls._instances[cls]
+    
+    class ResourceResult(list, metaclass=Singleton):
+        pass
+    
+    class DeploymentStatus(dict, metaclass=Singleton):
+        pass
+    
+    class PodStatus(dict, metaclass=Singleton):
+        def __setitem__(self, *args, **kwargs):
+            if args[0] in self and self[args[0]] == 'Terminating':
+                return
+            super().__setitem__(*args, **kwargs)
+    
+    class VirtualMachineStatus(dict, metaclass=Singleton):
+        pass
+    
+    class VirtualMachineReplicaSetStatus(dict, metaclass=Singleton):
+        pass
+    
+    class BaseKubernetes(object):
+        def __init__(self, *args, **kwargs):
+            self.kubernetes_client = client
+             # ====== KUBERNETES CONFIG ======
+            try:
+                config.load_incluster_config()
+                print("BaseKubernetes: Kubernetes config loaded")
+            except Exception as e:
+                print(f"BaseKubernetes: Kubernetes config error: {e}")
+                cfg = client.Configuration()
+                cfg.host = "https://kubernetes.default.svc"
+                cfg.verify_ssl = False
+                client.Configuration.set_default(cfg)
+
+            # ====== CODE ĐƠN GIẢN NHẤT - CHẮC CHẮN ĐÚNG ======
+            try:
+                # 1. Thử load_incluster_config (cách chuẩn)
+                config.load_incluster_config()
+                print("BaseKubernetes: load_incluster_config() succeeded")
+                
+            except Exception as e:
+                print(f"BaseKubernetes: load_incluster_config failed: {e}")
+                
+                # 2. Fallback: Cấu hình thủ công với token THẬT
+                try:
+                    # Đọc token THẬT từ service account
+                    with open('/var/run/secrets/kubernetes.io/serviceaccount/token', 'r') as f:
+                        token = f.read().strip()
+                    
+                    # Tạo config với token THẬT
+                    cfg = client.Configuration()
+                    cfg.host = "https://kubernetes.default.svc"
+                    cfg.verify_ssl = False  # MicroK8s cần cái này
+                    cfg.api_key['authorization'] = "Bearer " + token
+                    
+                    client.Configuration.set_default(cfg)
+                    print("BaseKubernetes: Manual config with REAL token succeeded")
+                    
+                except Exception as e2:
+                    print(f"BaseKubernetes: Manual config also failed: {e2}")
+                    # Vẫn tiếp tục với config mặc định
+            
+            # Khởi tạo clients
+            self.kubevirt_client = None
+            self.kubevirt_api = kubevirt_safe_stub
+            print("BaseKubernetes: KubeVirt stub initialized (bypassing version mismatch)")
+            self.api_client = client.ApiClient()
+            self.core_v1 = self.kubernetes_client.CoreV1Api()
+            self.app_v1 = self.kubernetes_client.AppsV1Api()
+            self.api_crd = self.kubernetes_client.CustomObjectsApi()
+            self.ApiException = ApiException
+            self.service_instance = None
+            self.watch = watch.Watch()
+            self.lock = threading.Lock()
+            self.rbac_authorization_v1 = self.kubernetes_client.RbacAuthorizationV1Api()
+            self.auto_scaling_v1 = self.kubernetes_client.AutoscalingV1Api()
+            self.deployment_status = DeploymentStatus()
+            self.pod_status = PodStatus()
+            self.virtual_machine_status = VirtualMachineStatus()
+            self.virtual_machine_replica_set = VirtualMachineReplicaSetStatus()
+# THÊM FILE MONITOR_DEPLOYMENT.PY ĐÃ FIX VÀO ĐÂY
+  monitor_deployment.py: |
+    import queue
+    import threading
+    import time
+    from functools import partial
+    from NSFaultManagement.utils.alarm_event import AlarmEvent
+    from VIMManagement.utils.base_kubernetes import BaseKubernetes
+    from utils.etcd_client.etcd_client import EtcdClient
+    
+    is_running = False
+    
+    class MonitorDeployment(BaseKubernetes):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.etcd_client = EtcdClient()
+            self.alarm = AlarmEvent()
+            global is_running
+            if not is_running:
+                threading.Thread(
+                    target=self._get_replica_event,
+                    args=(self.app_v1.list_deployment_for_all_namespaces, self.deployment_status),
+                    daemon=True
+                ).start()
+                threading.Thread(
+                    target=self._get_pod_event,
+                    daemon=True
+                ).start()
+                # KubeVirt threads are disabled in base_kubernetes stub
+            is_running = True
+    
+        def _get_replica_event(self, events, record: dict):
+            while True:
+                try:
+                    stream = self.watch.stream(partial(events), timeout_seconds=60)
+                    for event in stream:
+                        # FIX: Kiểm tra sự tồn tại của metadata để tránh KeyError
+                        obj = event.get('object')
+                        if not obj: continue
+                        
+                        metadata = obj.get('metadata') if hasattr(obj, 'get') else getattr(obj, 'metadata', None)
+                        if metadata is None: continue
+                        
+                        # Handle both dict and object types from K8s client
+                        name = metadata.get('name') if isinstance(metadata, dict) else getattr(metadata, 'name', None)
+                        if not name: continue
+                        
+                        spec = obj.get('spec') if isinstance(obj, dict) else getattr(obj, 'spec', None)
+                        replicas = spec.get('replicas') if isinstance(spec, dict) else getattr(spec, 'replicas', 0)
+                        
+                        record[name] = {'replicas': replicas}
+                except Exception as e:
+                    print(f"MonitorDeployment: Replica event error: {e}. Retrying in 5s...")
+                    time.sleep(5)
+    
+        def _get_pod_event(self):
+            while True:
+                try:
+                    stream = self.watch.stream(partial(self.core_v1.list_pod_for_all_namespaces), timeout_seconds=60)
+                    for event in stream:
+                        _type = event.get('type')
+                        obj = event.get('object')
+                        if not obj: continue
+
+                        # FIX: Safe access for metadata and status
+                        _metadata = obj.get('metadata') if hasattr(obj, 'get') else getattr(obj, 'metadata', {})
+                        _status = obj.get('status') if hasattr(obj, 'get') else getattr(obj, 'status', {})
+                        
+                        _name = _metadata.get('name') if isinstance(_metadata, dict) else getattr(_metadata, 'name', None)
+                        if not _name: continue
+
+                        _phase = _status.get('phase') if isinstance(_status, dict) else getattr(_status, 'phase', 'Unknown')
+                        
+                        if _phase == 'Running':
+                            self.pod_status[_name] = _phase
+    
+                        # Deletion timestamp check
+                        _del_ts = _metadata.get('deletionTimestamp') if isinstance(_metadata, dict) else getattr(_metadata, 'deletion_timestamp', None)
+
+                        if _type == 'MODIFIED' and _del_ts is None:
+                            _cont_statuses = _status.get('containerStatuses') if isinstance(_status, dict) else getattr(_status, 'container_statuses', [])
+                            if _cont_statuses:
+                                for s in _cont_statuses:
+                                    _state = s.get('state', {}) if isinstance(s, dict) else getattr(s, 'state', {})
+                                    _waiting = _state.get('waiting', {}) if isinstance(_state, dict) else getattr(_state, 'waiting', None)
+                                    if _waiting and (isinstance(_waiting, dict) and _waiting.get('reason') == 'CrashLoopBackOff'):
+                                        self.alarm.create_alarm(_name, 'CrashLoopBackOff', 'Pod is crashing', True)
+                                        if _name in self.pod_status: self.pod_crash_event(None, _name)
+    
+                        elif _type == 'DELETED' and _name in self.pod_status:
+                            self.pod_crash_event(_name, None)
+                            self.pod_status.pop(_name, None)
+                except Exception as e:
+                    print(f"MonitorDeployment: Pod event error: {e}. Retrying in 5s...")
+                    time.sleep(5)
+
+        def pod_crash_event(self, instance_name, pod_name):
+            try:
+                self.etcd_client.set_deploy_name(instance_name=instance_name, pod_name=pod_name)
+                self.etcd_client.release_pod_ip_address()
+            except: pass
+
+        def watch_specific_deployment(self, container_instance_name, vm_instance_name, _status, events):
+            _queue = queue.Queue()
+            success_count = 2
+            threading.Thread(target=partial(self._get_deploy_status, _queue=_queue, events=events, success_count=success_count), daemon=True).start()
+            threading.Thread(target=lambda q, n, s: q.put(self._check_status(n, s, True)), args=(_queue, container_instance_name, _status), daemon=True).start()
+            threading.Thread(target=lambda q, n, s: q.put(self._check_status(n, s, False)), args=(_queue, vm_instance_name, _status), daemon=True).start()
+    
+        def _check_status(self, input_set, status, isContainer):
+            while len(input_set) != 0:
+                all_resource = self.deployment_status if isContainer else self.virtual_machine_replica_set
+                server_set = self.pod_status if isContainer else self.virtual_machine_status
+                for item in list(input_set):
+                    if item in all_resource:
+                        if status == 'Terminating':
+                            if not any(item in _ for _ in list(server_set)):
+                                input_set.remove(item)
+                                all_resource.pop(item, None)
+                        else:
+                            count = sum(1 for name in server_set if item in name and server_set[name] == status)
+                            if all_resource[item].get('replicas', 0) == count:
+                                input_set.remove(item)
+                time.sleep(2)
+            return True
+    
+        def _get_deploy_status(self, _queue, events, success_count):
+            while success_count:
+                if _queue.get(): success_count -= 1
+            [event() for event in events]
+
+  custom_exception_handler.py: |
+    from rest_framework.views import exception_handler
+    
+    def custom_exception_handler(exc, context):
+        response = exception_handler(exc, context)
+        
+        if response is not None:
+            # Kiểm tra xem 'detail' có tồn tại không
+            if isinstance(response.data, dict):
+                if 'detail' in response.data:
+                    if hasattr(response.data['detail'], 'code'):
+                        code = response.data['detail'].code
+                        # Xử lý với code như cũ
+                        return response
+                
+                # Xử lý ValidationError - response.data là dict chứa field errors
+                # Không cần xử lý gì thêm, trả về response như bình thường
+                pass
+        
+        return response
+  serializers.py: |
+    # All Rights Reserved.
+    #
+    #
+    #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    #    not use this file except in compliance with the License. You may obtain
+    #    a copy of the License at
+    #
+    #         http://www.apache.org/licenses/LICENSE-2.0
+    #
+    #    Unless required by applicable law or agreed to in writing, software
+    #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    #    License for the specific language governing permissions and limitations
+    #    under the License.
+    import os
+
+    from rest_framework import serializers
+    from VnfPackageManagement.models import *
+    from utils.file_manipulation import create_dir
+    from utils.format_tools import transform_representation
+
+    vnf_package_base_path = os.getcwd() + "/VnfPackage/"
+    create_dir(vnf_package_base_path)
+
+
+    class VnfPkgInfoLinksSerializer(serializers.ModelSerializer):
+        self = serializers.CharField(source='link_self')
+
+        class Meta:
+            model = VnfPkgInfoLinks
+            fields = ('self', 'vnfd', 'packageContent')
+
+
+    class ChecksumSerializer(serializers.ModelSerializer):
+        class Meta:
+            model = Checksum
+            fields = ('algorithm', 'hash')
+
+
+    class VnfPackageArtifactInfoSerializer(serializers.ModelSerializer):
+        checksum = ChecksumSerializer(source='vnf_package_artifact_info_fk_checksum')
+
+        class Meta:
+            model = VnfPackageArtifactInfo
+            fields = ('artifactPath', 'checksum')
+
+
+    class VnfPackageSoftwareImageInfoSerializer(serializers.ModelSerializer):
+        class Meta:
+            model = VnfPackageSoftwareImageInfo
+            fields = ('id', 'name', 'provider', 'version', 'containerFormat', 'diskFormat', 'createdAt',
+                      'minDisk', 'minRam', 'size', 'userMetadata', 'imagePath')
+
+        def to_representation(self, instance):
+            return transform_representation(super().to_representation(instance))
+
+
+    class VnfPkgInfoSerializer(serializers.ModelSerializer):
+        checksum = ChecksumSerializer(required=False, source='vnf_package_info_fk_checksum')
+        _links = VnfPkgInfoLinksSerializer(required=False, source='vnf_package_info_fk_link')
+        additionalArtifacts = VnfPackageArtifactInfoSerializer(many=True, required=False,
+                                                               source='vnf_package_info_fk_artifactInfo')
+        softwareImages = VnfPackageSoftwareImageInfoSerializer(many=True, required=False,
+                                                               source='vnf_package_info_fk_software_image_info')
+
+        class Meta:
+            model = VnfPkgInfo
+            fields = '__all__'
+
+        def to_representation(self, instance):
+            return transform_representation(super().to_representation(instance))
+
+        def create(self, validated_data):
+            # FIX: Xử lý _links optional
+            link_value = validated_data.pop('vnf_package_info_fk_link', None)
+            vnf_package_info = VnfPkgInfo.objects.create(**validated_data)
+            path_content = ['vnfd', 'package_content']
+
+            for dir_name in path_content:
+                create_dir('{}{}/{}'.format(vnf_package_base_path, vnf_package_info.id, dir_name))
+
+            # Chỉ tạo links nếu có link_value
+            if link_value:
+                VnfPkgInfoLinks.objects.create(
+                    _links=vnf_package_info,
+                    **{'link_self': '{}{}'.format(link_value['link_self'], vnf_package_info.id),
+                       'vnfd': '{}{}/{}'.format(link_value[path_content[0]], vnf_package_info.id, path_content[0]),
+                       'packageContent': '{}{}/{}'.format(link_value['packageContent'], vnf_package_info.id, path_content[1])})
+            else:
+                # Tạo default links
+                base_url = "http://kube5gnfvo:8000/vnfpkgm/v1/vnf_packages/"
+                VnfPkgInfoLinks.objects.create(
+                    _links=vnf_package_info,
+                    **{'link_self': '{}{}/'.format(base_url, vnf_package_info.id),
+                       'vnfd': '{}{}/{}'.format(base_url, vnf_package_info.id, path_content[0]),
+                       'packageContent': '{}{}/{}'.format(base_url, vnf_package_info.id, path_content[1])})
+            
+            return vnf_package_info
+
+        def update(self, instance, validated_data):
+            if 'operationalState' in validated_data and 'userDefinedData' in validated_data:
+                instance.operationalState = validated_data['operationalState']
+                instance.userDefinedData = validated_data['userDefinedData']
+                instance.save()
+            else:
+                instance.vnfdId = validated_data['vnfdId']
+                instance.vnfProvider = validated_data['vnfProvider']
+                instance.vnfProductName = validated_data['vnfProductName']
+                instance.vnfdVersion = validated_data['vnfdVersion']
+                instance.vnfSoftwareVersion = validated_data['vnfSoftwareVersion']
+                Checksum.objects.create(vnf_package_info_fk_checksum=instance,
+                                        **validated_data['vnf_package_info_fk_checksum'])
+
+                if 'vnf_package_info_fk_artifactInfo' in validated_data:
+                    for vnf_pacakge_artifact in validated_data['vnf_package_info_fk_artifactInfo']:
+                        checksum = vnf_pacakge_artifact.pop('vnf_package_artifact_info_fk_checksum')
+                        additional_artifacts = VnfPackageArtifactInfo.objects.create(**vnf_pacakge_artifact)
+                        Checksum.objects.create(vnf_package_artifact_info_fk_checksum=additional_artifacts,
+                                                **checksum),
+                        instance.vnf_package_info_fk_artifactInfo.add(additional_artifacts)
+
+                for software_image_info_value in validated_data['vnf_package_info_fk_software_image_info']:
+                    software_image_info = VnfPackageSoftwareImageInfo.objects.create(
+                        **software_image_info_value)
+                    instance.vnf_package_info_fk_software_image_info.add(software_image_info)
+
+                instance.onboardingState = 'ONBOARDED'
+                instance.operationalState = 'ENABLED'
+                instance.usageState = 'NOT_IN_USE'
+                instance.save()
+
+            return instance
+    
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube5gnfvo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube5gnfvo
+  template:
+    metadata:
+      labels:
+        app: kube5gnfvo
+    spec:
+      serviceAccountName: kube5gnfvo
+      initContainers:
+      - name: wait-for-mysql
+        image: busybox:1.28
+        command: ['sh', '-c', "until nslookup kube5gnfvo-mysql; do echo waiting for mysql; sleep 2; done"]
+      containers:
+      - name: kube5gnfvo
+        image: free5gmano/kube5gnfvo-stage2
+        env:
+        - name: DATABASE_PASSWORD
+          value: "password"
+        - name: DATABASE_HOST
+          value: "kube5gnfvo-mysql"
+        - name: DATABASE_PORT
+          value: "3306"
+        command: ["/bin/sh","-c"]
+        args: ['python3 manage.py migrate && python3 manage.py runserver 0:8000']
+        ports:
+        - containerPort: 8000
+          name: kube5gnfvo
+        volumeMounts:
+        - name: kube5gnfvo-vnf-package
+          mountPath: /root/NSD
+          subPath: NSD
+        - name: kube5gnfvo-vnf-package
+          mountPath: /root/VnfPackage
+          subPath: VnfPackage
+        - name: kube-config
+          mountPath: /root/config
+          subPath: config
+        # QUAN TRỌNG: Mount file đã fix
+        - name: fixed-code
+          mountPath: /root/VIMManagement/utils/base_kubernetes.py
+          subPath: base_kubernetes.py
+        - name: fixed-code  # Sử dụng cùng volume name
+          mountPath: /root/VIMManagement/utils/monitor_deployment.py # Kiểm tra kỹ đường dẫn này
+          subPath: monitor_deployment.py
+        - name: fixed-code
+          mountPath: /root/utils/custom_exception_handler.py
+          subPath: custom_exception_handler.py
+        - name: fixed-code
+          mountPath: /root/VnfPackageManagement/serializers.py
+          subPath: serializers.py
+      volumes:
+      - name: kube5gnfvo-vnf-package
+        persistentVolumeClaim:
+          claimName: kube5gnfvo-pvc
+      - name: kube-config
+        configMap:
+          name: kube5gnfvo-config
+          items:
+          - key: config
+            path: config
+      # QUAN TRỌNG: Volume chứa code đã fix
+      - name: fixed-code
+        configMap:
+          name: kube5gnfvo-fixed-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube5gnfvo
+spec:
+  type: NodePort
+  ports:
+  - port: 8000
+    nodePort: 30888
+  selector:
+    app: kube5gnfvo
