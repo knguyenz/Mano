@@ -35,6 +35,7 @@ from nssmf.serializers import SliceTemplateSerializer, SliceTemplateRelationSeri
 from nssmf.models import SliceTemplate, GenericTemplate, ServiceMappingPluginModel, Content
 from nssmf.enums import OperationStatus, PluginOperationStatus
 from free5gmano import settings
+from moi.models import NetworkSliceSubnet
 
 
 class CustomAuthToken(ObtainAuthToken):
@@ -296,7 +297,7 @@ class ProvisioningView(GenericViewSet, mixins.CreateModelMixin, mixins.DestroyMo
                         service_plugin['subscription_host'],
                         parameter)
             nfvo_plugin.allocate_nssi()
-            unit_query.instanceId.add(nfvo_plugin.nssiId)
+            unit_query.instanceId.add(NetworkSliceSubnet.objects.get(nssiId=nfvo_plugin.nssiId))
             return JsonResponse(nfvo_plugin.moi_config)
         except IOError as e:
             return JsonResponse(response_data, status=400)

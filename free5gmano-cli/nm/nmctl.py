@@ -616,19 +616,23 @@ def create_subscriptions(type, nss_instance_id):
                 }
             header = {"Content-Type": "application/vnd.kafka.v2+json"}
             consumers = requests.post(url=url, json=data, headers=header)
+            from urllib.parse import urlparse, urlunparse
+            _parsed = urlparse(consumers.json()["base_uri"])
+            _base_uri = urlunparse(_parsed._replace(netloc="{0}:{1}".format(settings.Kafka_HOST, settings.Kafka_PORT)))
             click.echo("Listen Kafka:")
-            click.echo(consumers.json()['base_uri'] + "/subscription")
+            click.echo(_base_uri + "/subscription")
             data = {"topics": ["fault_alarm"]}
-            subscribe = requests.post(url=consumers.json()['base_uri'] + "/subscription",
+            subscribe = requests.post(url=_base_uri + "/subscription",
                                       json=data, headers=header)
             header = {"Content-Type": "application/vnd.kafka.json.v2+json"}
 
             while 1:
-                record = requests.get(url=consumers.json()['base_uri'] + "/records", headers=header)
+                record = requests.get(url=_base_uri + "/records", headers=header)
                 if record.json():
                     click.echo(base64.b64decode(record.json()[-1]['value']).decode())
                     break
                 time.sleep(3)
+            requests.delete(url=_base_uri, headers={"Content-Type": "application/vnd.kafka.v2+json"})
             click.echo('OperationSucceeded')
         else:
             click.echo('OperationFailed')
@@ -670,19 +674,23 @@ def create_subscriptions(type, nss_instance_id):
         }
         header = {"Content-Type": "application/vnd.kafka.v2+json"}
         consumers = requests.post(url=url, json=data, headers=header)
+        from urllib.parse import urlparse, urlunparse
+        _parsed = urlparse(consumers.json()["base_uri"])
+        _base_uri = urlunparse(_parsed._replace(netloc="{0}:{1}".format(settings.Kafka_HOST, settings.Kafka_PORT)))
         click.echo("Listen Kafka:")
-        click.echo(consumers.json()['base_uri'] + "/subscription")
+        click.echo(_base_uri + "/subscription")
         data = {"topics": ["ns_instance"]}
-        subscribe = requests.post(url=consumers.json()['base_uri'] + "/subscription",
+        subscribe = requests.post(url=_base_uri + "/subscription",
                                 json=data, headers=header)
         header = {"Content-Type": "application/vnd.kafka.json.v2+json"}
 
         while 1:
-            record = requests.get(url=consumers.json()['base_uri'] + "/records", headers=header)
+            record = requests.get(url=_base_uri + "/records", headers=header)
             if record.json():
                 click.echo(base64.b64decode(record.json()[-1]['value']).decode())
                 break
             time.sleep(1)
+        requests.delete(url=_base_uri, headers={"Content-Type": "application/vnd.kafka.v2+json"})
         click.echo('OperationSucceeded')
 
 

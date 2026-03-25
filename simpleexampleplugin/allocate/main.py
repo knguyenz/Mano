@@ -3,6 +3,7 @@ import requests
 import zipfile
 import json
 import os
+from urllib.parse import urlparse
 
 
 class NFVOPlugin(AllocateNSSIabc):
@@ -18,7 +19,13 @@ class NFVOPlugin(AllocateNSSIabc):
         self.vnf_instance_data = list()
         self.nsi_subscription_id = str()
         self.nsinfo = dict()
-        self.headers = {'Content-type': 'application/json'}
+        parsed = urlparse(self.NFVO_URL)
+        host = parsed.hostname or 'localhost'
+        if '.' not in host and host != 'localhost':
+            host = '{}.default.svc.cluster.local'.format(host)
+        if parsed.port:
+            host = '{}:{}'.format(host, parsed.port)
+        self.headers = {'Content-type': 'application/json', 'Host': host}
 
     def coordinate_tn_manager(self):
         pass
@@ -29,10 +36,14 @@ class NFVOPlugin(AllocateNSSIabc):
        # Đảm bảo moi_config được convert từ string sang dict nếu cần
        # NFVO cần các trường này để vượt qua bước Validation _links
         data = {
+            "_links": {
+                "vnfd": self.NFVO_URL + "vnfpkgm/v1/vnf_packages/placeholder/vnfd/",
+                "packageContent": self.NFVO_URL + "vnfpkgm/v1/vnf_packages/placeholder/package_content/"
+            },
             "userDefinedData": {
-               "moi_config": str(moi_config)
-           }
-       }
+                "moi_config": str(moi_config)
+            }
+        }
       
        # In ra console để bạn kiểm tra data trước khi gửi
         print(f"Sending POST to NFVO: {url} with data: {data}")
